@@ -57,34 +57,117 @@ public struct TextPane: View, PrimitiveView {
         public var text: String { spans.map(\.text).joined() }
     }
 
+    /// The pane's measured size, written during layout.
+    ///
+    /// A view learns how big it is only during layout, by which time the caller
+    /// has already decided what to draw. Handing the pane a box to write into
+    /// closes that loop without a second render pass: the caller reads it when
+    /// it handles a key, not while laying out. Without it, anything sized in
+    /// rows — a page-down, a jump to the bottom — has to guess.
+    public final class Viewport {
+        public var height: Int
+        public var width: Int
+
+        public init(height: Int = 0, width: Int = 0) {
+            self.height = height
+            self.width = width
+        }
+    }
+
     private let lines: [Line]
     private let offset: Int
+    private let anchor: Int?
     private let columnOffset: Int
+    private let viewport: Viewport?
 
-    public init(lines: [Line], offset: Int = 0, columnOffset: Int = 0) {
+    public init(
+        lines: [Line],
+        offset: Int = 0,
+        columnOffset: Int = 0,
+        viewport: Viewport? = nil
+    ) {
+        self.init(
+            lines: lines, offset: offset, anchor: nil,
+            columnOffset: columnOffset, viewport: viewport)
+    }
+
+    /// Scrolls to keep `anchor` on screen, moving as little as it can.
+    ///
+    /// The caller cannot do this itself: how many rows a pane has is settled
+    /// during layout, and guessing it means the selection vanishes on a short
+    /// terminal and the view scrolls early on a tall one.
+    public init(
+        lines: [Line],
+        keeping anchor: Int,
+        columnOffset: Int = 0,
+        viewport: Viewport? = nil
+    ) {
+        self.init(
+            lines: lines, offset: 0, anchor: anchor,
+            columnOffset: columnOffset, viewport: viewport)
+    }
+
+    private init(
+        lines: [Line],
+        offset: Int,
+        anchor: Int?,
+        columnOffset: Int,
+        viewport: Viewport?
+    ) {
         self.lines = lines
         self.offset = offset
+        self.anchor = anchor
         self.columnOffset = columnOffset
+        self.viewport = viewport
+    }
+
+    /// Where a pane of `height` rows should start so that `anchor` is visible,
+    /// given that it currently starts at `current`.
+    ///
+    /// It scrolls by the minimum needed rather than re-centring: re-centring on
+    /// every move makes the whole view slide under a held key, which is both
+    /// disorienting and much more to redraw.
+    public static func scrollOffset(
+        anchor: Int, current: Int, height: Int, count: Int
+    ) -> Int {
+        guard height > 0, count > height else { return 0 }
+        var offset = current
+        if anchor < offset {
+            offset = anchor
+        } else if anchor >= offset + height {
+            offset = anchor - height + 1
+        }
+        return min(max(offset, 0), count - height)
     }
 
     static var size: Int? { 1 }
 
     func buildNode(_ node: Node) {
         node.control = TextPaneControl(
-            lines: lines, offset: offset, columnOffset: columnOffset)
+            lines: lines, offset: offset, anchor: anchor,
+            columnOffset: columnOffset, viewport: viewport)
     }
 
     func updateNode(_ node: Node) {
         node.view = self
         let control = node.control as! TextPaneControl
-        control.set(lines: lines, offset: offset, columnOffset: columnOffset)
+        control.set(
+            lines: lines, offset: offset, anchor: anchor,
+            columnOffset: columnOffset, viewport: viewport)
         control.layer.invalidate()
     }
 
     private class TextPaneControl: Control {
         private var lines: [Line]
         private var offset: Int
+        private var anchor: Int?
         private var columnOffset: Int
+        private var viewport: Viewport?
+
+        /// Where the pane currently starts. Kept across updates so anchored
+        /// scrolling can move by the minimum, rather than recomputing from
+        /// scratch and jumping.
+        private var scrollOffset = 0
 
         /// One entry per character of a line, so `cell(at:)` — called for every
         /// visible cell on every frame — is an array index rather than a walk of
@@ -97,16 +180,27 @@ public struct TextPane: View, PrimitiveView {
         }
         private var cache: [Int: Rendered] = [:]
 
-        init(lines: [Line], offset: Int, columnOffset: Int) {
+        init(
+            lines: [Line], offset: Int, anchor: Int?,
+            columnOffset: Int, viewport: Viewport?
+        ) {
             self.lines = lines
             self.offset = offset
+            self.anchor = anchor
             self.columnOffset = columnOffset
+            self.viewport = viewport
+            self.scrollOffset = offset
         }
 
-        func set(lines: [Line], offset: Int, columnOffset: Int) {
+        func set(
+            lines: [Line], offset: Int, anchor: Int?,
+            columnOffset: Int, viewport: Viewport?
+        ) {
             self.lines = lines
             self.offset = offset
+            self.anchor = anchor
             self.columnOffset = columnOffset
+            self.viewport = viewport
             cache = [:]
         }
 
@@ -114,6 +208,19 @@ public struct TextPane: View, PrimitiveView {
 
         override func layout(size: Size) {
             super.layout(size: size)
+            let height = size.height.intValue
+            viewport?.height = height
+            viewport?.width = size.width.intValue
+
+            // Resolved here rather than in cell(at:) so every cell of a frame
+            // is drawn against the same offset.
+            if let anchor {
+                scrollOffset = TextPane.scrollOffset(
+                    anchor: anchor, current: scrollOffset,
+                    height: height, count: lines.count)
+            } else {
+                scrollOffset = offset
+            }
             cache = [:]
         }
 
@@ -133,7 +240,7 @@ public struct TextPane: View, PrimitiveView {
         }
 
         override func cell(at position: Position) -> Cell? {
-            let index = offset + position.line.intValue
+            let index = scrollOffset + position.line.intValue
             guard index >= 0, index < lines.count else { return Cell(char: " ") }
 
             let line = lines[index]
