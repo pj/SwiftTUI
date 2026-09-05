@@ -47,3 +47,15 @@ struct ArrowKeyParser {
     }
 
 }
+
+
+extension Application.Key {
+    init(_ arrow: ArrowKeyParser.ArrowKey) {
+        switch arrow {
+        case .up: self = .up
+        case .down: self = .down
+        case .left: self = .left
+        case .right: self = .right
+        }
+    }
+}

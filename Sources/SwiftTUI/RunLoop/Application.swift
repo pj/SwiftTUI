@@ -13,6 +13,20 @@ public class Application {
 
     private var arrowKeyParser = ArrowKeyParser()
 
+    /// A key as delivered to `keyHandler`.
+    public enum Key: Equatable {
+        case character(Character)
+        case up, down, left, right
+    }
+
+    /// Called before a key is routed to the focused control. Return true to
+    /// consume it.
+    ///
+    /// Upstream sends every key to `window.firstResponder` and nowhere else,
+    /// which makes application-wide bindings (quit, refresh, edit) impossible
+    /// without a control stealing focus.
+    public var keyHandler: ((Key) -> Bool)?
+
     private var invalidatedNodes: [Node] = []
     private var updateScheduled = false
 
@@ -100,6 +114,7 @@ public class Application {
             if arrowKeyParser.parse(character: char) {
                 guard let key = arrowKeyParser.arrowKey else { continue }
                 arrowKeyParser.arrowKey = nil
+                if keyHandler?(Key(key)) == true { continue }
                 if key == .down {
                     if let next = window.firstResponder?.selectableElement(below: 0) {
                         window.firstResponder?.resignFirstResponder()
@@ -127,7 +142,7 @@ public class Application {
                 }
             } else if char == ASCII.EOT {
                 stop()
-            } else {
+            } else if keyHandler?(.character(char)) != true {
                 window.firstResponder?.handleEvent(char)
             }
         }
@@ -172,6 +187,33 @@ public class Application {
         }
         window.layer.frame.size = Size(width: Extended(Int(size.ws_col)), height: Extended(Int(size.ws_row)))
         renderer.setCache()
+    }
+
+    /// Repaints the whole screen from scratch, discarding the diff cache.
+    ///
+    /// Needed whenever something outside the framework has written to the
+    /// terminal, and the only way to measure a full frame.
+    public func refresh() {
+        renderer.setCache()
+        renderer.draw()
+    }
+
+    /// Gives the terminal back to a child program (an editor, a pager), then
+    /// restores raw mode and repaints from scratch.
+    ///
+    /// The cache has to be dropped as well as the screen: the renderer only
+    /// writes cells it believes have changed, so a screen clobbered by another
+    /// program would otherwise be repainted as a no-op.
+    public func suspend(_ body: () -> Void) {
+        renderer.stop()
+        resetInputMode()
+        body()
+        setInputMode()
+        renderer.setup()
+        updateWindowSize()
+        renderer.setCache()
+        control.layout(size: window.layer.frame.size)
+        renderer.draw()
     }
 
     private func stop() {

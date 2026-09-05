@@ -38,6 +38,11 @@ class Renderer {
         cache = .init(repeating: .init(repeating: nil, count: layer.frame.size.width.intValue), count: layer.frame.size.height.intValue)
     }
 
+    /// Cells are emitted into this and flushed once per frame. Upstream issued a
+    /// write(2) per cell, which for a full-screen repaint is tens of thousands of
+    /// syscalls — the source comment calls the drawing slow and this is why.
+    private var frame = ""
+
     /// Draw a specific area, or the entire layer if the area is nil.
     func draw(rect: Rect? = nil) {
         if rect == nil { layer.invalidated = nil }
@@ -54,6 +59,13 @@ class Renderer {
                 }
             }
         }
+        flush()
+    }
+
+    private func flush() {
+        guard !frame.isEmpty else { return }
+        write(frame)
+        frame = ""
     }
 
     func stop() {
@@ -68,51 +80,53 @@ class Renderer {
         if cache[position.line.intValue][position.column.intValue] != cell {
             cache[position.line.intValue][position.column.intValue] = cell
             if self.currentPosition != position {
-                write(EscapeSequence.moveTo(position))
+                buffer(EscapeSequence.moveTo(position))
                 self.currentPosition = position
             }
             if self.currentForegroundColor != cell.foregroundColor {
-                write(cell.foregroundColor.foregroundEscapeSequence)
+                buffer(cell.foregroundColor.foregroundEscapeSequence)
                 self.currentForegroundColor = cell.foregroundColor
             }
             let backgroundColor = cell.backgroundColor ?? .default
             if self.currentBackgroundColor != backgroundColor {
-                write(backgroundColor.backgroundEscapeSequence)
+                buffer(backgroundColor.backgroundEscapeSequence)
                 self.currentBackgroundColor = backgroundColor
             }
             self.updateAttributes(cell.attributes)
-            write(String(cell.char))
+            buffer(String(cell.char))
             self.currentPosition.column += 1
         }
     }
 
-    private func setup() {
+    func setup() {
         write(EscapeSequence.enableAlternateBuffer)
         write(EscapeSequence.clearScreen)
         write(EscapeSequence.moveTo(currentPosition))
         write(EscapeSequence.hideCursor)
     }
 
+    private func buffer(_ str: String) { frame += str }
+
     private func updateAttributes(_ attributes: CellAttributes) {
         if currentAttributes.bold != attributes.bold {
-            if attributes.bold { write(EscapeSequence.enableBold) }
-            else { write(EscapeSequence.disableBold) }
+            if attributes.bold { buffer(EscapeSequence.enableBold) }
+            else { buffer(EscapeSequence.disableBold) }
         }
         if currentAttributes.italic != attributes.italic {
-            if attributes.italic { write(EscapeSequence.enableItalic) }
-            else { write(EscapeSequence.disableItalic) }
+            if attributes.italic { buffer(EscapeSequence.enableItalic) }
+            else { buffer(EscapeSequence.disableItalic) }
         }
         if currentAttributes.underline != attributes.underline {
-            if attributes.underline { write(EscapeSequence.enableUnderline) }
-            else { write(EscapeSequence.disableUnderline) }
+            if attributes.underline { buffer(EscapeSequence.enableUnderline) }
+            else { buffer(EscapeSequence.disableUnderline) }
         }
         if currentAttributes.strikethrough != attributes.strikethrough {
-            if attributes.strikethrough { write(EscapeSequence.enableStrikethrough) }
-            else { write(EscapeSequence.disableStrikethrough) }
+            if attributes.strikethrough { buffer(EscapeSequence.enableStrikethrough) }
+            else { buffer(EscapeSequence.disableStrikethrough) }
         }
         if currentAttributes.inverted != attributes.inverted {
-            if attributes.inverted { write(EscapeSequence.enableInverted) }
-            else { write(EscapeSequence.disableInverted) }
+            if attributes.inverted { buffer(EscapeSequence.enableInverted) }
+            else { buffer(EscapeSequence.disableInverted) }
         }
         currentAttributes = attributes
     }
