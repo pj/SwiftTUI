@@ -11,12 +11,18 @@ public class Application {
 
     private let runLoopType: RunLoopType
 
-    private var arrowKeyParser = ArrowKeyParser()
+    private var keyParser = KeyParser()
 
     /// A key as delivered to `keyHandler`.
     public enum Key: Equatable {
         case character(Character)
         case up, down, left, right
+        case pageUp, pageDown, home, end
+        case enter, tab, backTab, backspace, delete, escape
+        /// A recognised-but-unmapped escape sequence. Reported rather than
+        /// dropped so an unbound function key cannot leak its characters into
+        /// the UI as stray letters.
+        case unknown
     }
 
     /// Called before a key is routed to the focused control. Return true to
@@ -52,6 +58,8 @@ public class Application {
     }
 
     var stdInSource: DispatchSourceRead?
+    private var sigTStpSource: DispatchSourceSignal?
+    private var sigContSource: DispatchSourceSignal?
 
     public enum RunLoopType {
         /// The default option, using Dispatch for the main run loop.
@@ -80,6 +88,20 @@ public class Application {
         sigWinChSource.setEventHandler(qos: .default, flags: [], handler: self.handleWindowSizeChange)
         sigWinChSource.resume()
 
+        // Without this, Ctrl-Z suspends the process with the terminal still in
+        // raw mode and the alternate buffer active — the shell you land back in
+        // is unusable until you blind-type `reset`.
+        signal(SIGTSTP, SIG_IGN)
+        let sigTStpSource = DispatchSource.makeSignalSource(signal: SIGTSTP, queue: .main)
+        sigTStpSource.setEventHandler(qos: .default, flags: [], handler: self.suspendToShell)
+        sigTStpSource.resume()
+        self.sigTStpSource = sigTStpSource
+
+        let sigContSource = DispatchSource.makeSignalSource(signal: SIGCONT, queue: .main)
+        sigContSource.setEventHandler(qos: .default, flags: [], handler: self.resumeFromShell)
+        sigContSource.resume()
+        self.sigContSource = sigContSource
+
         signal(SIGINT, SIG_IGN)
         let sigIntSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
         sigIntSource.setEventHandler(qos: .default, flags: [], handler: self.stop)
@@ -105,47 +127,53 @@ public class Application {
 
     private func handleInput() {
         let data = FileHandle.standardInput.availableData
-
-        guard let string = String(data: data, encoding: .utf8) else {
-            return
-        }
+        guard let string = String(data: data, encoding: .utf8) else { return }
 
         for char in string {
-            if arrowKeyParser.parse(character: char) {
-                guard let key = arrowKeyParser.arrowKey else { continue }
-                arrowKeyParser.arrowKey = nil
-                if keyHandler?(Key(key)) == true { continue }
-                if key == .down {
-                    if let next = window.firstResponder?.selectableElement(below: 0) {
-                        window.firstResponder?.resignFirstResponder()
-                        window.firstResponder = next
-                        window.firstResponder?.becomeFirstResponder()
-                    }
-                } else if key == .up {
-                    if let next = window.firstResponder?.selectableElement(above: 0) {
-                        window.firstResponder?.resignFirstResponder()
-                        window.firstResponder = next
-                        window.firstResponder?.becomeFirstResponder()
-                    }
-                } else if key == .right {
-                    if let next = window.firstResponder?.selectableElement(rightOf: 0) {
-                        window.firstResponder?.resignFirstResponder()
-                        window.firstResponder = next
-                        window.firstResponder?.becomeFirstResponder()
-                    }
-                } else if key == .left {
-                    if let next = window.firstResponder?.selectableElement(leftOf: 0) {
-                        window.firstResponder?.resignFirstResponder()
-                        window.firstResponder = next
-                        window.firstResponder?.becomeFirstResponder()
-                    }
-                }
-            } else if char == ASCII.EOT {
-                stop()
-            } else if keyHandler?(.character(char)) != true {
-                window.firstResponder?.handleEvent(char)
+            for key in keyParser.parse(char) { handle(key) }
+        }
+
+        // A lone Esc cannot be told from the start of a sequence by content
+        // alone, only by the silence after it.
+        if keyParser.isPending {
+            DispatchQueue.main.asyncAfter(deadline: .now() + KeyParser.escapeTimeout) {
+                for key in self.keyParser.flush() { self.handle(key) }
             }
         }
+    }
+
+    private func handle(_ key: Key) {
+        if keyHandler?(key) == true { return }
+
+        switch key {
+        case .character(ASCII.EOT):
+            stop()
+        case .up, .down, .left, .right:
+            moveFocus(key)
+        case .character(let char):
+            window.firstResponder?.handleEvent(char)
+        case .enter:
+            window.firstResponder?.handleEvent("\n")
+        case .backspace:
+            window.firstResponder?.handleEvent(ASCII.DEL)
+        default:
+            break
+        }
+    }
+
+    private func moveFocus(_ key: Key) {
+        let next: Control?
+        switch key {
+        case .down:  next = window.firstResponder?.selectableElement(below: 0)
+        case .up:    next = window.firstResponder?.selectableElement(above: 0)
+        case .right: next = window.firstResponder?.selectableElement(rightOf: 0)
+        case .left:  next = window.firstResponder?.selectableElement(leftOf: 0)
+        default:     next = nil
+        }
+        guard let next else { return }
+        window.firstResponder?.resignFirstResponder()
+        window.firstResponder = next
+        window.firstResponder?.becomeFirstResponder()
     }
 
     func invalidateNode(_ node: Node) {
@@ -187,6 +215,22 @@ public class Application {
         }
         window.layer.frame.size = Size(width: Extended(Int(size.ws_col)), height: Extended(Int(size.ws_row)))
         renderer.setCache()
+    }
+
+    private func suspendToShell() {
+        renderer.stop()
+        resetInputMode()
+        // Re-raise with the default handler so the process actually stops.
+        signal(SIGTSTP, SIG_DFL)
+        raise(SIGTSTP)
+    }
+
+    private func resumeFromShell() {
+        signal(SIGTSTP, SIG_IGN)
+        setInputMode()
+        renderer.setup()
+        updateWindowSize()
+        refresh()
     }
 
     /// Repaints the whole screen from scratch, discarding the diff cache.
